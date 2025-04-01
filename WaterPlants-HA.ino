@@ -3,6 +3,7 @@
 #include <ArduinoJson.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <ArduinoOTA.h>  // 添加OTA库
 
 // 保持原有的引脚定义
 #define MotorSW_PIN 13       //灌溉马达开关
@@ -26,6 +27,8 @@ const int MQTT_PORT = 1883;       // MQTT端口，默认1883
 const char* MQTT_USER = "summer";    // MQTT用户名
 const char* MQTT_PASSWORD = "Pp@123456"; // MQTT密码
 const char* DEVICE_NAME = "water_plants"; // 设备名称
+const char* OTA_PASSWORD = "plantadmin";  // OTA更新密码
+const char* SW_VERSION = "1.0.1";         // 软件版本
 
 // 保持原有的默认值设置
 int MotorSW_state = 0;               //默认关闭灌溉马达，0-关闭，1-开启
@@ -57,15 +60,20 @@ bool isWatering0 = 0;
 bool isWatering1 = 0;
 
 // 保持原有的传感器读取函数
-// float getTemperature() {
-//   sensors.requestTemperatures();
-//   float tempC = sensors.getTempCByIndex(0);
-//   if (tempC == DEVICE_DISCONNECTED_C) {
-//     Serial.println("Error: Could not read temperature data");
-//     return NAN;
-//   }
-//   return tempC;
-// }
+float getTemperature() {
+  // 检查温度传感器是否存在并正常工作
+  sensors.requestTemperatures();
+  float tempC = sensors.getTempCByIndex(0);
+  
+  if (tempC == DEVICE_DISCONNECTED_C || tempC == -127.00) {
+    Serial.println("温度传感器未连接或工作异常");
+    // 在这里您可以选择返回一个固定值替代NAN
+    // 例如返回25.0作为默认室温值
+    return NAN; // 如果您想发送替代值，可以改为 return 25.0;
+  }
+  
+  return tempC;
+}
 
 const float referenceVoltage = 3.3;
 const float humidityVoltageScale = 1.47;
@@ -190,7 +198,13 @@ void publishState() {
   StaticJsonDocument<256> doc3;
   doc3["humidity0"] = getHumidity(HumUpdate0_PIN);
   doc3["humidity1"] = getHumidity(HumUpdate1_PIN);
-  // doc3["temperature"] = getTemperature();
+  
+  // 尝试获取温度，如果读取失败则不添加到JSON中
+  float temperature = getTemperature();
+  if (!isnan(temperature)) {
+    doc3["temperature"] = temperature;
+  }
+  
   doc3["solar_voltage"] = getsolarVol(SolarVol_PIN);
   doc3["have_water"] = digitalRead(HaveWater_PIN);
   doc3["wifi_rssi"] = WiFi.RSSI();
@@ -216,7 +230,14 @@ void publishState() {
   doc4["hum_level1"] = HumLevel1_state;
   doc4["humidity0"] = getHumidity(HumUpdate0_PIN);
   doc4["humidity1"] = getHumidity(HumUpdate1_PIN);
+  
+  // 也在简化状态中检查温度
+  if (!isnan(temperature)) {
+    doc4["temperature"] = temperature;
+  }
+  
   doc4["have_water"] = digitalRead(HaveWater_PIN);
+  doc4["solar_voltage"] = getsolarVol(SolarVol_PIN);
   
   String jsonString4;
   serializeJson(doc4, jsonString4);
@@ -289,7 +310,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
     return;
   }
   
-  // 发布更新后的状态
+  // 立即发布更新后的状态
   publishState();
 }
 
@@ -312,11 +333,11 @@ void publishDiscovery() {
   delay(100);
   publishSensorDiscovery("humidity1", "土壤湿度1", "%");
   delay(100);
-  // publishSensorDiscovery("temperature", "温度", "°C");
-  // delay(100);
+  publishSensorDiscovery("temperature", "温度", "°C");
+  delay(100);
   publishSensorDiscovery("solar_voltage", "电池电压", "V");
   delay(100);
-  publishSensorDiscovery("wifi_rssi", "WiFi信号", "dBm");
+  publishWifiRssiDiscovery("wifi_rssi", "WiFi信号", "dBm");
   delay(100);
   
   // 发布二进制传感器
@@ -348,10 +369,11 @@ void publishSwitchDiscovery(const char* id, const char* name) {
   doc["name"] = name;
   doc["unique_id"] = String("water_plants_") + id;
   doc["command_topic"] = String(MQTT_COMMAND_TOPIC_PREFIX) + "/" + id + "/set";
-  doc["state_topic"] = MQTT_STATE_TOPIC;
+  doc["state_topic"] = String(MQTT_STATE_TOPIC) + "/switches";
   doc["value_template"] = String("{{ value_json.") + id + " }}";
   doc["payload_on"] = "1";
   doc["payload_off"] = "0";
+  doc["retain"] = true;
   
   JsonObject device = createDeviceConfig(doc);
   
@@ -382,11 +404,12 @@ void publishNumberDiscovery(const char* id, const char* name, int min, int max, 
   doc["name"] = name;
   doc["unique_id"] = String("water_plants_") + id;
   doc["command_topic"] = String(MQTT_COMMAND_TOPIC_PREFIX) + "/" + id + "/set";
-  doc["state_topic"] = MQTT_STATE_TOPIC;
-  doc["value_template"] = String("{{ value_json.") + id + " }}";
+  doc["state_topic"] = String(MQTT_STATE_TOPIC) + "/thresholds";
+  doc["value_template"] = String("{{ value_json.") + id + " | int }}";
   doc["min"] = min;
   doc["max"] = max;
   doc["step"] = step;
+  doc["retain"] = true;
   
   JsonObject device = createDeviceConfig(doc);
   
@@ -414,9 +437,17 @@ void publishSensorDiscovery(const char* id, const char* name, const char* unit) 
   
   doc["name"] = name;
   doc["unique_id"] = String("water_plants_") + id;
-  doc["state_topic"] = MQTT_STATE_TOPIC;
-  doc["value_template"] = String("{{ value_json.") + id + " }}";
+  doc["state_topic"] = String(MQTT_STATE_TOPIC) + "/sensors";
+  doc["value_template"] = String("{{ value_json.") + id + " | float }}";
   doc["unit_of_measurement"] = unit;
+  doc["state_class"] = "measurement";
+  
+  // 为特定传感器类型添加device_class
+  if (strcmp(id, "temperature") == 0) {
+    doc["device_class"] = "temperature";
+  } else if (strcmp(id, "solar_voltage") == 0) {
+    doc["device_class"] = "voltage";
+  }
   
   JsonObject device = createDeviceConfig(doc);
   
@@ -446,10 +477,19 @@ void publishBinarySensorDiscovery(const char* id, const char* name) {
   
   doc["name"] = name;
   doc["unique_id"] = String("water_plants_") + id;
-  doc["state_topic"] = MQTT_STATE_TOPIC;
+  doc["state_topic"] = String(MQTT_STATE_TOPIC) + "/sensors";
   doc["value_template"] = String("{{ value_json.") + id + " }}";
   doc["payload_on"] = "1";
   doc["payload_off"] = "0";
+  doc["device_class"] = "moisture";
+  
+  // 特殊处理水位状态
+  if (strcmp(id, "have_water") == 0) {
+    doc["payload_on"] = "1";
+    doc["payload_off"] = "0";
+    doc["state_on"] = "充足";
+    doc["state_off"] = "缺水";
+  }
   
   JsonObject device = createDeviceConfig(doc);
   
@@ -459,7 +499,48 @@ void publishBinarySensorDiscovery(const char* id, const char* name) {
   Serial.print(id);
   Serial.print(": ");
   Serial.println(jsonString);
-  client.publish(topic.c_str(), jsonString.c_str(), true);
+  bool published = client.publish(topic.c_str(), jsonString.c_str(), true);
+  if (published) {
+    Serial.print("Successfully published binary sensor discovery for ");
+    Serial.println(id);
+  } else {
+    Serial.print("Failed to publish binary sensor discovery for ");
+    Serial.println(id);
+  }
+}
+
+// 专门为WiFi信号强度创建的发现配置
+void publishWifiRssiDiscovery(const char* id, const char* name, const char* unit) {
+  String topic = String(MQTT_DISCOVERY_PREFIX) + "/sensor/water_plants/" + id + "/config";
+  StaticJsonDocument<512> doc;
+  
+  doc["name"] = name;
+  doc["unique_id"] = String("water_plants_") + id;
+  doc["state_topic"] = String(MQTT_STATE_TOPIC) + "/sensors";
+  doc["value_template"] = String("{{ value_json.") + id + " }}"; // 不需要float过滤器，因为RSSI本身是整数
+  doc["unit_of_measurement"] = unit;
+  doc["state_class"] = "measurement";
+  doc["device_class"] = "signal_strength";
+  
+  JsonObject device = createDeviceConfig(doc);
+  
+  String jsonString;
+  serializeJson(doc, jsonString);
+  Serial.print("Publishing RSSI sensor discovery for ");
+  Serial.print(id);
+  Serial.print(" to topic: ");
+  Serial.println(topic);
+  Serial.print("Payload: ");
+  Serial.println(jsonString);
+  
+  bool published = client.publish(topic.c_str(), jsonString.c_str(), true);
+  if (published) {
+    Serial.print("Successfully published RSSI sensor discovery for ");
+    Serial.println(id);
+  } else {
+    Serial.print("Failed to publish RSSI sensor discovery for ");
+    Serial.println(id);
+  }
 }
 
 // 创建共享的设备配置
@@ -469,8 +550,62 @@ JsonObject createDeviceConfig(JsonDocument& doc) {
   device["name"] = "Water Plants";
   device["model"] = "ESP32 Water Plants Controller";
   device["manufacturer"] = "DIY";
-  device["sw_version"] = "1.0.0";
+  device["sw_version"] = SW_VERSION;
   return device;
+}
+
+// 设置OTA
+void setupOTA() {
+  // 设置设备名称
+  ArduinoOTA.setHostname(DEVICE_NAME);
+  
+  // 设置密码
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+
+  // 回调函数
+  ArduinoOTA.onStart([]() {
+    String type;
+    if (ArduinoOTA.getCommand() == U_FLASH) {
+      type = "sketch";
+    } else {  // U_FS
+      type = "filesystem";
+    }
+    // 更新开始前的准备工作
+    Serial.println("开始OTA更新 " + type);
+    // 关闭所有输出
+    digitalWrite(MotorSW_PIN, LOW);
+    digitalWrite(WaterSW0_PIN, LOW);
+    digitalWrite(WaterSW1_PIN, LOW);
+  });
+  
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nOTA更新完成");
+  });
+  
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("更新进度: %u%%\r", (progress / (total / 100)));
+  });
+  
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA错误[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) {
+      Serial.println("认证失败");
+    } else if (error == OTA_BEGIN_ERROR) {
+      Serial.println("开始失败");
+    } else if (error == OTA_CONNECT_ERROR) {
+      Serial.println("连接失败");
+    } else if (error == OTA_RECEIVE_ERROR) {
+      Serial.println("接收失败");
+    } else if (error == OTA_END_ERROR) {
+      Serial.println("结束失败");
+    }
+  });
+  
+  // 启动OTA
+  ArduinoOTA.begin();
+  Serial.println("OTA准备就绪");
+  Serial.print("IP地址: ");
+  Serial.println(WiFi.localIP());
 }
 
 // 连接WiFi
@@ -592,7 +727,7 @@ void connectMQTT() {
 void setup() {
   Serial.begin(115200);
   Serial.println("\n\n===== ESP32 WaterPlants Controller Starting =====");
-  Serial.println("Version: 1.0.0");
+  Serial.println("Version: " + String(SW_VERSION));
   
   // 设置引脚模式
   Serial.println("Initializing pins...");
@@ -613,6 +748,10 @@ void setup() {
   Serial.println("Starting WiFi connection...");
   connectWiFi();
 
+  // 设置OTA
+  Serial.println("Setting up OTA...");
+  setupOTA();
+
   // 设置MQTT
   Serial.println("Setting up MQTT client...");
   client.setServer(MQTT_SERVER, MQTT_PORT);
@@ -630,6 +769,9 @@ void setup() {
 }
 
 void loop() {
+  // 处理OTA事件
+  ArduinoOTA.handle();
+  
   static unsigned long lastDebugTime = 0;
   static unsigned long loopCounter = 0;
   loopCounter++;
